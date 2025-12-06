@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "slack": {
+      "command": "/absolute/path/to/your/project/mcp_server/venv/bin/python",
+      "args": [
+        "/absolute/path/to/your/project/mcp_server/slack_mcp_server.py"
+      ],
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-your-bot-token-here"
+      }
+    }
+  }
+}
+
