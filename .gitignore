@@ -1,5 +1,11 @@
 # Environment variables (NEVER commit these!)
 .env
+.env.*
+!.env.template
+
+# MCP config with secrets
+mcp.json
+~/.cursor/mcp.json
 
 # Python
 __pycache__/
