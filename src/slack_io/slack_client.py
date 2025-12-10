@@ -12,20 +12,49 @@ log = logging.getLogger(__name__)
 
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
 
-def post_message(channel: str, text: str, username: str, icon_emoji: str=None, thread_ts: str=None):
+def get_persona_user_token(persona: str) -> str:
+    """Get user token for a specific persona"""
+    if not persona:
+        return None
+    env_key = f"SLACK_USER_TOKEN_{persona.upper()}"
+    return os.getenv(env_key)
+
+def post_message(channel: str, text: str, username: str, icon_emoji: str=None, thread_ts: str=None, persona: str=None):
+    # Check if bots are enabled
+    bots_enabled = os.getenv("BOTS_ENABLED", "true").lower() == "true"
+    if not bots_enabled:
+        log.info("Bots are disabled - skipping message post")
+        return {"ok": False, "error": "bots_disabled"}
+    
+    # Try to use persona-specific user token first
+    client = app.client
+    use_user_token = False
+    
+    if persona:
+        user_token = get_persona_user_token(persona)
+        if user_token:
+            from slack_sdk import WebClient
+            client = WebClient(token=user_token)
+            use_user_token = True
+            log.info(f"Using user token for persona: {persona}")
+    
     args = {
         "channel": channel,
         "text": text,
-        "username": username,   
     }
 
+    # Only add username/icon for bot tokens, not user tokens
+    if not use_user_token:
+        args["username"] = username
     if icon_emoji:
         args["icon_emoji"] = icon_emoji
+    
     if thread_ts:
-        args["threads_ts"] = thread_ts
+        args["thread_ts"] = thread_ts
+        
     while True:
         try:
-            return app.client.chat_postMessage(**args)
+            return client.chat_postMessage(**args)
         except SlackApiError as e:
             if e.response.status_code == 429:
                 wait = int(e.response.headers.get("Retry-After", "1"))

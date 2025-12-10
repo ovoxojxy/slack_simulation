@@ -329,16 +329,19 @@ def _schedule_reply(persona: str, ch_name: str, channel_id: str, event_text: str
         username = PERSONAS[persona]["username"]
         icon = PERSONAS[persona]["icon"]
         
+        # Use persona-specific posting (will use user token if available)
+        from .slack_client import post_message
+        
         if is_thread:
             _queue_for(channel_id).enqueue(
-                bolt_app.client.chat_postMessage,
-                channel=channel_id, text=visible_text, username=username, icon_emoji=icon, thread_ts=thread_ts
+                post_message,
+                channel=channel_id, text=visible_text, username=username, icon_emoji=icon, thread_ts=thread_ts, persona=persona
             )
         else:
             # Top-level reply in channel
             _queue_for(channel_id).enqueue(
-                bolt_app.client.chat_postMessage,
-                channel=channel_id, text=visible_text, username=username, icon_emoji=icon
+                post_message,
+                channel=channel_id, text=visible_text, username=username, icon_emoji=icon, persona=persona
             )
         
         _update_state(thread_ts, persona, time.time())

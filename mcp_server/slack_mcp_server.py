@@ -61,10 +61,29 @@ slack_client = WebClient(token=slack_bot_token)
 # User client (if user token is available)
 slack_user_client = WebClient(token=slack_user_token) if slack_user_token else None
 
+# Persona-specific user token mapping
+def get_persona_user_tokens():
+    """Dynamically discover persona-specific user tokens from environment"""
+    persona_tokens = {}
+    for key, value in os.environ.items():
+        if key.startswith("SLACK_USER_TOKEN_") and key != "SLACK_USER_TOKEN":
+            persona_name = key.replace("SLACK_USER_TOKEN_", "").lower()
+            persona_tokens[persona_name] = value
+    return persona_tokens
+
+PERSONA_USER_TOKENS = get_persona_user_tokens()
+
+# Bot control
+BOTS_ENABLED = os.getenv("BOTS_ENABLED", "true").lower() == "true"
+
+if PERSONA_USER_TOKENS:
+    logger.info(f"Persona user tokens detected for: {list(PERSONA_USER_TOKENS.keys())}")
 if slack_user_client:
-    logger.info("User token detected - can post as actual Slack users")
+    logger.info("Generic user token detected - can post as actual Slack users")
 else:
-    logger.info("No user token - will post as bot with custom username/emoji")
+    logger.info("No generic user token - will use persona tokens or bot with custom username/emoji")
+    
+logger.info(f"Bot control enabled: {BOTS_ENABLED}")
 
 # Cache for channel data
 CHANNEL_CACHE = {}
@@ -175,7 +194,8 @@ def post_message_to_slack(
     username: Optional[str] = None,
     icon_emoji: Optional[str] = None,
     thread_ts: Optional[str] = None,
-    as_user: bool = False
+    as_user: bool = False,
+    persona: Optional[str] = None
 ) -> dict:
     """
     Post a message to Slack
@@ -187,21 +207,49 @@ def post_message_to_slack(
         icon_emoji: Custom emoji (bot token only)
         thread_ts: Thread timestamp to reply to
         as_user: If True and user token available, post as actual user
+        persona: Persona name (e.g., "sam_altman") to use persona-specific user token
     """
     try:
-        # Determine which client to use
-        client = slack_user_client if (as_user and slack_user_client) else slack_client
+        # Check if bots are enabled
+        if not BOTS_ENABLED:
+            logger.info("Bots are disabled - skipping message post")
+            return {
+                "success": False,
+                "error": "bots_disabled",
+                "message": "Bot posting is currently disabled"
+            }
+        
+        # Determine which client and mode to use
+        client = slack_client
+        posting_mode = "bot"
+        
+        # Priority 1: Persona-specific user token
+        if persona and persona.lower() in PERSONA_USER_TOKENS:
+            persona_token = PERSONA_USER_TOKENS[persona.lower()]
+            client = WebClient(token=persona_token)
+            posting_mode = "persona_user"
+            logger.info(f"Posting as persona user '{persona}' to {channel}")
+        
+        # Priority 2: Generic user token (if as_user=True)
+        elif as_user and slack_user_client:
+            client = slack_user_client
+            posting_mode = "generic_user"
+            logger.info(f"Posting as generic user to {channel}")
+        
+        # Priority 3: Bot token with customization
+        else:
+            posting_mode = "bot"
+            logger.info(f"Posting as bot to {channel}")
         
         kwargs = {
             "channel": channel,
             "text": text,
         }
         
-        # User token posts as the authenticated user (no custom username/emoji)
-        if as_user and slack_user_client:
-            logger.info(f"Posting as actual user to {channel}")
-            # User tokens don't support username/icon_emoji
-            # The message appears from the authenticated user
+        # User tokens (persona or generic) don't support username/icon_emoji
+        if posting_mode in ["persona_user", "generic_user"]:
+            # Message appears from the authenticated user account
+            pass
         else:
             # Bot token allows custom username and emoji
             if username:
@@ -217,7 +265,8 @@ def post_message_to_slack(
             "success": True,
             "ts": response.get("ts"),
             "channel": response.get("channel"),
-            "posted_as": "user" if (as_user and slack_user_client) else "bot",
+            "posted_as": posting_mode,
+            "persona": persona if posting_mode == "persona_user" else None,
         }
         
     except SlackApiError as e:
@@ -400,11 +449,11 @@ async def list_tools() -> list[Tool]:
                     },
                     "username": {
                         "type": "string",
-                        "description": "Username to post as (bot mode only, ignored if as_user=true)"
+                        "description": "Username to post as (bot mode only, ignored if persona or as_user is used)"
                     },
                     "icon_emoji": {
                         "type": "string",
-                        "description": "Emoji icon for the message (e.g., ':robot_face:') (bot mode only, ignored if as_user=true)"
+                        "description": "Emoji icon for the message (e.g., ':robot_face:') (bot mode only, ignored if persona or as_user is used)"
                     },
                     "thread_ts": {
                         "type": "string",
@@ -414,6 +463,10 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "If true and user token is available, post as authenticated Slack user (ignores username/icon_emoji)",
                         "default": False
+                    },
+                    "persona": {
+                        "type": "string",
+                        "description": "Persona name (e.g., 'sam_altman', 'mike_be') to post as that specific user. Takes priority over as_user."
                     }
                 },
                 "required": ["channel", "text"]
@@ -438,6 +491,21 @@ async def list_tools() -> list[Tool]:
                     }
                 },
                 "required": ["query"]
+            }
+        ),
+        Tool(
+            name="slack_bot_control",
+            description="Control bot behavior (pause/resume posting)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Control action to perform",
+                        "enum": ["pause", "resume", "status"]
+                    }
+                },
+                "required": ["action"]
             }
         )
     ]
@@ -550,6 +618,7 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
             icon_emoji = arguments.get("icon_emoji")
             thread_ts = arguments.get("thread_ts")
             as_user = arguments.get("as_user", False)
+            persona = arguments.get("persona")
             
             # Resolve channel name to ID if needed
             if channel.startswith("#"):
@@ -575,21 +644,37 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 username=username,
                 icon_emoji=icon_emoji,
                 thread_ts=thread_ts,
-                as_user=as_user
+                as_user=as_user,
+                persona=persona
             )
             
             if result["success"]:
                 posted_mode = result.get("posted_as", "bot")
-                mode_text = "as actual user" if posted_mode == "user" else "as bot"
+                persona_name = result.get("persona")
+                
+                if posted_mode == "persona_user":
+                    mode_text = f"as persona user '{persona_name}'"
+                elif posted_mode == "generic_user":
+                    mode_text = "as generic user"
+                else:
+                    mode_text = "as bot"
+                    
                 return [TextContent(
                     type="text",
                     text=f"✓ Message posted successfully to #{channels[channel_id]['name']} {mode_text}\n"
                          f"Message timestamp: {result['ts']}"
                 )]
             else:
+                error_msg = result.get("error", "unknown error")
+                if error_msg == "bots_disabled":
+                    return [TextContent(
+                        type="text",
+                        text="⏸️ Bot posting is currently disabled. Use '/resume-bots' to enable."
+                )]
+            else:
                 return [TextContent(
                     type="text",
-                    text=f"✗ Failed to post message: {result['error']}"
+                        text=f"✗ Failed to post message: {error_msg}"
                 )]
         
         elif name == "slack_search_messages":
@@ -622,6 +707,37 @@ async def call_tool(name: str, arguments: Any) -> Sequence[TextContent]:
                 return [TextContent(
                     type="text",
                     text=f"Search failed: {e.response['error']}"
+                )]
+        
+        elif name == "slack_bot_control":
+            action = arguments["action"]
+            global BOTS_ENABLED
+            
+            if action == "pause":
+                BOTS_ENABLED = False
+                return [TextContent(
+                    type="text",
+                    text="⏸️ Bot posting has been paused. Messages will not be sent until resumed."
+                )]
+            elif action == "resume":
+                BOTS_ENABLED = True
+                return [TextContent(
+                    type="text",
+                    text="▶️ Bot posting has been resumed. Messages will now be sent normally."
+                )]
+            elif action == "status":
+                status = "enabled" if BOTS_ENABLED else "disabled"
+                persona_count = len(PERSONA_USER_TOKENS)
+                return [TextContent(
+                    type="text",
+                    text=f"🤖 Bot Status: {status}\n"
+                         f"📊 Persona user tokens available: {persona_count}\n"
+                         f"👥 Personas: {', '.join(PERSONA_USER_TOKENS.keys()) if PERSONA_USER_TOKENS else 'None'}"
+                )]
+            else:
+                return [TextContent(
+                    type="text",
+                    text=f"Unknown bot control action: {action}"
                 )]
         
         else:

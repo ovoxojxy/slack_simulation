@@ -11,7 +11,14 @@ def _post_root(persona: str, channel_name: str, text:str) -> Optional[str]:
         return None
     username = PERSONAS[persona]["username"]
     icon = PERSONAS[persona]["icon"]
-    resp = bolt_app.client.chat_postMessage(channel=ch_id, text=text, username=username, icon_emoji=icon)
+    
+    # Use persona-specific posting (will use user token if available)
+    from .slack_client import post_message
+    resp = post_message(channel=ch_id, text=text, username=username, icon_emoji=icon, persona=persona)
+    
+    if not resp.get("ok", True):
+        return None
+        
     ts = resp["ts"]
     mark_persona_cooldown(persona)
     return ts
