@@ -3,6 +3,10 @@ import os, re
 import numpy as np
 from typing import List, Dict, Set
 from openai import OpenAI
+import google.generativeai as genai
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from anthropic import Anthropic
@@ -25,7 +29,7 @@ USE_EMBEDDINGS = ENABLE_EMBEDDING_CHECKS and LLM_PROVIDER != "claude"
 
 _openai_client = None
 _anthropic_client = None
-
+_gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 
 def get_openai_client():
     """Lazy-load OpenAI client."""
@@ -49,6 +53,17 @@ def get_anthropic_client():
             raise ValueError("CLAUDE_API_KEY not set in environment variables")
         _anthropic_client = Anthropic(api_key=api_key)
     return _anthropic_client
+
+def _get_gemini_model():
+    """Lazy-load the Gemini model."""
+    global _gemini_model
+    if _gemini_model is None:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY environment variable not set")
+        genai.configure(api_key=api_key)
+        _gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+    return _gemini_model
 
 def get_embedding(text: str) -> List[float]:
     """Get embedding for text (OpenAI only)."""
@@ -92,11 +107,51 @@ def _call_claude_chat(system_prompt: str, user_prompt: str, max_tokens: int = MA
     return "\n".join(part.strip() for part in text_parts if part.strip())
 
 
-def _call_model(system_prompt: str, user_prompt: str, max_tokens: int = MAX_AGENT_TOKENS) -> str:
-    """Dispatch to selected LLM provider."""
-    if LLM_PROVIDER == "claude":
-        return _call_claude_chat(system_prompt, user_prompt, max_tokens=max_tokens)
-    return _call_openai_chat(system_prompt, user_prompt, max_tokens=max_tokens)
+def _call_gemini_chat(
+        system_prompt: str,
+        user_message: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024
+) -> str:
+    """Call Gemini API for chat completion."""
+    model = _get_gemini_model()
+
+    # Gemini doesn't have separate system messages, so prepend to user message
+    full_prompt = f"{system_prompt}\n\n{user_message}"
+
+    generation_config = genai.types.GenerationConfig(
+        temperature=temperature,
+        max_output_tokens=max_tokens,
+    )
+
+    try:
+        response = model.generate_content(
+            full_prompt,
+            generation_config=generation_config
+        )
+        return response.text
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        raise
+
+
+def _call_model(
+        system_prompt: str,
+        user_message: str,
+        temperature: float = 0.7,
+        max_tokens: int = 1024
+) -> str:
+    """Call the configured LLM provider."""
+    provider = os.getenv("LLM_PROVIDER", "openai").lower()
+
+    if provider == "openai":
+        return _call_openai_chat(system_prompt, user_message, temperature, max_tokens)
+    elif provider == "claude":
+        return _call_claude_chat(system_prompt, user_message, temperature, max_tokens)
+    elif provider == "gemini":  # <-- ADD THIS
+        return _call_gemini_chat(system_prompt, user_message, temperature, max_tokens)
+    else:
+        raise ValueError(f"Unknown LLM provider: {provider}. Use 'openai', 'claude', or 'gemini'")
 
 
 def call_agent_model(system_prompt: str, user_prompt: str, max_tokens: int = MAX_AGENT_TOKENS) -> str:

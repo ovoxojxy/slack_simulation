@@ -13,6 +13,14 @@ try:
     from anthropic import Anthropic
 except ImportError:
     Anthropic = None
+try:
+    import google.generativeai as genai
+    from google.generativeai.types import FunctionDeclaration, Tool, content_types
+except ImportError:
+    genai = None
+    FunctionDeclaration = None
+    Tool = None
+    content_types = None
 from .tools import (
     get_router,
     TOOL_DEFINITIONS,
@@ -76,12 +84,30 @@ def get_claude_temperature() -> float:
         return float(os.getenv("CLAUDE_TEMPERATURE", "0.2"))
     except ValueError:
         return 0.2
+def get_gemini_model() -> str:
+    """Get Gemini model name dynamically."""
+    return os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
+def get_gemini_max_output_tokens() -> int:
+    """Get Gemini max output tokens dynamically."""
+    try:
+        return int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+    except ValueError:
+        return 1024
+
+def get_gemini_temperature() -> float:
+    """Get Gemini temperature dynamically."""
+    try:
+        return float(os.getenv("GEMINI_TEMPERATURE", "0.7"))
+    except ValueError:
+        return 0.7
 def get_model_name() -> str:
     """Get the active model name based on provider."""
     provider = get_llm_provider()
     if provider == "claude":
         return get_claude_model()
+    elif provider == "gemini":
+        return get_gemini_model()
     return get_openai_model()
 
 # LLM_PROVIDER and related variables are now read dynamically via functions above
@@ -90,6 +116,7 @@ def get_model_name() -> str:
 # Lazy initialization of clients to avoid errors if .env not loaded yet
 _openai_client = None
 _anthropic_client = None
+_gemini_model_instance = None
 
 def get_openai_client():
     """Get or create OpenAI client (lazy initialization)."""
@@ -114,13 +141,31 @@ def get_anthropic_client():
         _anthropic_client = Anthropic(api_key=api_key)
     return _anthropic_client
 
+def get_gemini_client():
+    """Get or create Gemini model (lazy initialization)."""
+    global _gemini_model_instance
+    if _gemini_model_instance is None:
+        if genai is None:
+            raise ImportError(
+                "google-generativeai package is not installed. "
+                "Please run: pip install google-generativeai"
+            )
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise ValueError("GOOGLE_API_KEY not set in environment variables")
+        genai.configure(api_key=api_key)
+        _gemini_model_instance = genai.GenerativeModel(get_gemini_model())
+    return _gemini_model_instance
+
 # Get router instance
 router = get_router()
 
 
 def _get_tool_definitions_for_provider() -> List[Dict[str, Any]]:
     """Return tool definitions formatted for the active provider."""
-    if get_llm_provider() == "claude":
+    provider = get_llm_provider()
+
+    if provider == "claude":
         claude_tools = []
         for tool in TOOL_DEFINITIONS:
             fn = tool.get("function", {})
@@ -130,6 +175,13 @@ def _get_tool_definitions_for_provider() -> List[Dict[str, Any]]:
                 "input_schema": fn.get("parameters", {"type": "object"})
             })
         return claude_tools
+
+    elif provider == "gemini":
+        # Return OpenAI format - we'll convert in _call_gemini_llm
+        # This keeps the interface consistent
+        return TOOL_DEFINITIONS
+
+    # OpenAI format (default)
     return TOOL_DEFINITIONS
 
 
@@ -237,6 +289,177 @@ def _convert_messages_for_claude(messages: List[Dict[str, Any]]) -> Tuple[Option
     return system_prompt, claude_messages
 
 
+def _convert_json_schema_to_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert JSON Schema (OpenAI format) to Gemini's schema format.
+
+    Gemini uses a subset of OpenAPI 3.0 schema.
+    """
+    if not schema:
+        return {"type": "OBJECT", "properties": {}}
+
+    # Map JSON Schema types to Gemini types
+    type_mapping = {
+        "string": "STRING",
+        "number": "NUMBER",
+        "integer": "INTEGER",
+        "boolean": "BOOLEAN",
+        "array": "ARRAY",
+        "object": "OBJECT",
+    }
+
+    result = {}
+
+    # Handle type
+    json_type = schema.get("type", "object")
+    if isinstance(json_type, list):
+        # Handle nullable types like ["string", "null"]
+        json_type = [t for t in json_type if t != "null"][0] if json_type else "string"
+    result["type"] = type_mapping.get(json_type, "STRING")
+
+    # Handle description
+    if "description" in schema:
+        result["description"] = schema["description"]
+
+    # Handle enum
+    if "enum" in schema:
+        result["enum"] = schema["enum"]
+
+    # Handle properties (for objects)
+    if "properties" in schema:
+        result["properties"] = {}
+        for prop_name, prop_schema in schema["properties"].items():
+            result["properties"][prop_name] = _convert_json_schema_to_gemini(prop_schema)
+
+    # Handle required fields
+    if "required" in schema:
+        result["required"] = schema["required"]
+
+    # Handle array items
+    if "items" in schema:
+        result["items"] = _convert_json_schema_to_gemini(schema["items"])
+
+    return result
+
+
+def _convert_tools_for_gemini(openai_tools: List[Dict[str, Any]]) -> List:
+    """
+    Convert OpenAI-format tool definitions to Gemini FunctionDeclaration objects.
+    """
+    if not openai_tools or genai is None:
+        return []
+
+    gemini_functions = []
+
+    for tool in openai_tools:
+        if tool.get("type") != "function":
+            continue
+
+        fn = tool.get("function", {})
+        name = fn.get("name")
+        description = fn.get("description", "")
+        parameters = fn.get("parameters", {})
+
+        if not name:
+            continue
+
+        # Convert parameters schema
+        gemini_params = _convert_json_schema_to_gemini(parameters)
+
+        # Create FunctionDeclaration
+        func_decl = FunctionDeclaration(
+            name=name,
+            description=description,
+            parameters=gemini_params if gemini_params.get("properties") else None
+        )
+        gemini_functions.append(func_decl)
+
+    return gemini_functions
+
+
+def _convert_messages_for_gemini(messages: List[Dict[str, Any]]) -> Tuple[Optional[str], List]:
+    """
+    Convert OpenAI-style messages to Gemini's content format.
+
+    Returns:
+        Tuple of (system_instruction, gemini_contents)
+    """
+    system_instruction = None
+    gemini_contents = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "")
+
+        if role == "system":
+            # Gemini uses system_instruction parameter
+            system_instruction = content
+            continue
+
+        elif role == "user":
+            gemini_contents.append({
+                "role": "user",
+                "parts": [{"text": content}]
+            })
+
+        elif role == "assistant":
+            parts = []
+
+            # Add text content if present
+            if content:
+                parts.append({"text": content})
+
+            # Add function calls if present
+            tool_calls = msg.get("tool_calls", [])
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                func_name = func.get("name")
+                func_args = func.get("arguments", "{}")
+
+                # Parse arguments
+                if isinstance(func_args, str):
+                    try:
+                        func_args = json.loads(func_args)
+                    except json.JSONDecodeError:
+                        func_args = {}
+
+                parts.append({
+                    "function_call": {
+                        "name": func_name,
+                        "args": func_args
+                    }
+                })
+
+            if parts:
+                gemini_contents.append({
+                    "role": "model",  # Gemini uses "model" instead of "assistant"
+                    "parts": parts
+                })
+
+        elif role == "tool":
+            # Tool results in Gemini are function_response parts
+            tool_call_id = msg.get("tool_call_id", "")
+            tool_content = msg.get("content", "")
+
+            # Parse the content if it's JSON
+            try:
+                response_data = json.loads(tool_content) if isinstance(tool_content, str) else tool_content
+            except json.JSONDecodeError:
+                response_data = {"result": tool_content}
+
+            gemini_contents.append({
+                "role": "user",  # Function responses come from "user" role in Gemini
+                "parts": [{
+                    "function_response": {
+                        "name": tool_call_id.split("_")[0] if "_" in tool_call_id else tool_call_id,
+                        "response": response_data
+                    }
+                }]
+            })
+
+    return system_instruction, gemini_contents
+
+
 def _call_openai_llm(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]):
     """Call OpenAI Chat Completions API."""
     # Get model name dynamically
@@ -328,10 +551,148 @@ def _call_claude_llm(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]
     return message_dict, tool_calls
 
 
+def _call_gemini_llm(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]):
+    """
+    Call Google Gemini API with full function calling support.
+
+    Args:
+        messages: OpenAI-format message history
+        tools: OpenAI-format tool definitions
+
+    Returns:
+        Tuple of (message_dict, tool_calls) matching OpenAI/Claude format
+    """
+    # Get the base model
+    base_model = get_gemini_client()
+
+    # Convert tools to Gemini format
+    gemini_functions = _convert_tools_for_gemini(tools)
+
+    # Create model with tools if we have any
+    if gemini_functions:
+        gemini_tools = [Tool(function_declarations=gemini_functions)]
+        model = genai.GenerativeModel(
+            model_name=get_gemini_model(),
+            tools=gemini_tools,
+            system_instruction=None  # We'll set this from messages
+        )
+    else:
+        model = base_model
+
+    # Convert messages to Gemini format
+    system_instruction, gemini_contents = _convert_messages_for_gemini(messages)
+
+    # If we have a system instruction, recreate model with it
+    if system_instruction:
+        if gemini_functions:
+            gemini_tools = [Tool(function_declarations=gemini_functions)]
+            model = genai.GenerativeModel(
+                model_name=get_gemini_model(),
+                tools=gemini_tools,
+                system_instruction=system_instruction
+            )
+        else:
+            model = genai.GenerativeModel(
+                model_name=get_gemini_model(),
+                system_instruction=system_instruction
+            )
+
+    # Configure generation
+    generation_config = genai.types.GenerationConfig(
+        temperature=get_gemini_temperature(),
+        max_output_tokens=get_gemini_max_output_tokens(),
+    )
+
+    try:
+        # Start chat with history (all but last message)
+        if len(gemini_contents) > 1:
+            chat = model.start_chat(history=gemini_contents[:-1])
+            # Send the last message
+            last_content = gemini_contents[-1]
+            last_parts = last_content.get("parts", [])
+            # Extract text from parts
+            last_text = ""
+            for part in last_parts:
+                if isinstance(part, dict) and "text" in part:
+                    last_text = part["text"]
+                    break
+            response = chat.send_message(last_text, generation_config=generation_config)
+        elif gemini_contents:
+            # Just one message
+            last_content = gemini_contents[0]
+            last_parts = last_content.get("parts", [])
+            last_text = ""
+            for part in last_parts:
+                if isinstance(part, dict) and "text" in part:
+                    last_text = part["text"]
+                    break
+            response = model.generate_content(last_text, generation_config=generation_config)
+        else:
+            raise ValueError("No messages to send to Gemini")
+
+    except Exception as e:
+        logger.error(f"[LLM] Gemini API call failed: {e}")
+        raise
+
+    # Parse response
+    text_parts = []
+    tool_calls = []
+
+    # Handle the response
+    if hasattr(response, 'candidates') and response.candidates:
+        candidate = response.candidates[0]
+        if hasattr(candidate, 'content') and candidate.content:
+            for part in candidate.content.parts:
+                # Check for text
+                if hasattr(part, 'text') and part.text:
+                    text_parts.append(part.text)
+
+                # Check for function call
+                if hasattr(part, 'function_call') and part.function_call:
+                    fc = part.function_call
+                    # Generate a unique ID for the tool call
+                    tool_call_id = f"{fc.name}_{len(tool_calls)}"
+
+                    # Convert args to dict
+                    args_dict = dict(fc.args) if fc.args else {}
+
+                    tool_calls.append(_normalize_tool_call(
+                        tool_call_id=tool_call_id,
+                        name=fc.name,
+                        arguments=args_dict
+                    ))
+
+    # Also try direct text access for simpler responses
+    if not text_parts and hasattr(response, 'text'):
+        try:
+            text_parts.append(response.text)
+        except Exception:
+            pass
+
+    content_text = "\n".join(part.strip() for part in text_parts if part and part.strip())
+
+    message_dict = {
+        "role": "assistant",
+        "content": content_text or None,
+    }
+    if tool_calls:
+        message_dict["tool_calls"] = tool_calls
+
+    logger.info(f"[LLM] Gemini response: {len(content_text)} chars, {len(tool_calls)} tool calls")
+
+    return message_dict, tool_calls
+
+
 def _call_llm(messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]):
     """Dispatch to the appropriate LLM provider."""
-    if get_llm_provider() == "claude":
+    provider = get_llm_provider()
+
+    logger.info(f"[LLM] Using provider: {provider}")
+
+    if provider == "claude":
         return _call_claude_llm(messages, tools)
+    elif provider == "gemini":
+        return _call_gemini_llm(messages, tools)
     return _call_openai_llm(messages, tools)
 
 # Tracer configuration from environment variables

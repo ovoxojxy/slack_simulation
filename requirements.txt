@@ -4,6 +4,7 @@ slack-sdk
 
 # AI/LLM
 openai
+google-generativeai
 
 # Environment management
 python-dotenv
